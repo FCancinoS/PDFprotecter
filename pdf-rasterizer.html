@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rasterizador de PDF local</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f3f4f6;
+      color: #111827;
+    }
+    .card {
+      width: min(720px, calc(100% - 32px));
+      background: white;
+      border-radius: 18px;
+      padding: 28px;
+      box-shadow: 0 16px 50px rgba(0,0,0,.12);
+    }
+    h1 { margin: 0 0 10px; font-size: 28px; }
+    p { color: #4b5563; line-height: 1.5; }
+    .drop-zone {
+      border: 2px dashed #9ca3af;
+      border-radius: 14px;
+      padding: 34px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: .2s ease;
+      margin: 22px 0;
+    }
+    .drop-zone.dragover {
+      border-color: #2563eb;
+      background: #eff6ff;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    label { font-size: 14px; font-weight: 600; }
+    select, input[type="range"], button {
+      width: 100%;
+      margin-top: 7px;
+    }
+    select, button {
+      padding: 11px 12px;
+      border-radius: 10px;
+      border: 1px solid #d1d5db;
+      font-size: 15px;
+    }
+    button {
+      border: 0;
+      background: #111827;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    progress { width: 100%; height: 16px; }
+    .status { margin-top: 12px; font-size: 14px; color: #374151; }
+    .file-name { font-weight: 700; color: #111827; }
+    .note {
+      margin-top: 18px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #f9fafb;
+      font-size: 13px;
+      color: #4b5563;
+    }
+    @media (max-width: 620px) {
+      .controls { grid-template-columns: 1fr; }
+      .card { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Rasterizador de PDF</h1>
+    <p>Convierte cada página en una imagen y crea un PDF nuevo sin texto, vectores ni elementos editables. Todo se procesa localmente en tu navegador.</p>
+
+    <div id="dropZone" class="drop-zone">
+      <div><strong>Arrastra un PDF aquí</strong></div>
+      <div style="margin-top:6px;color:#6b7280">o haz clic para seleccionarlo</div>
+      <input id="fileInput" type="file" accept="application/pdf" hidden />
+    </div>
+
+    <div id="fileInfo" class="file-name">Ningún archivo seleccionado</div>
+
+    <div class="controls">
+      <label>
+        Resolución
+        <select id="dpiSelect">
+          <option value="150">150 DPI — ligero</option>
+          <option value="200">200 DPI</option>
+          <option value="300" selected>300 DPI — recomendado</option>
+          <option value="400">400 DPI — alta calidad</option>
+        </select>
+      </label>
+
+      <label>
+        Calidad JPEG: <span id="qualityValue">92%</span>
+        <input id="qualityRange" type="range" min="60" max="100" value="92" />
+      </label>
+    </div>
+
+    <button id="rasterizeBtn" disabled>Rasterizar y descargar PDF</button>
+
+    <div style="margin-top:18px">
+      <progress id="progress" value="0" max="100"></progress>
+      <div id="status" class="status">Esperando archivo.</div>
+    </div>
+
+    <div class="note">
+      No se aplica OCR. El PDF resultante contiene una imagen por página. Si el original tiene enlaces, formularios, texto seleccionable o vectores, se perderán deliberadamente.
+    </div>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs" type="module"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <script type="module">
+    import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs';
+
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
+
+    const { jsPDF } = window.jspdf;
+
+    const fileInput = document.getElementById('fileInput');
+    const dropZone = document.getElementById('dropZone');
+    const fileInfo = document.getElementById('fileInfo');
+    const dpiSelect = document.getElementById('dpiSelect');
+    const qualityRange = document.getElementById('qualityRange');
+    const qualityValue = document.getElementById('qualityValue');
+    const rasterizeBtn = document.getElementById('rasterizeBtn');
+    const progress = document.getElementById('progress');
+    const status = document.getElementById('status');
+
+    let selectedFile = null;
+
+    qualityRange.addEventListener('input', () => {
+      qualityValue.textContent = `${qualityRange.value}%`;
+    });
+
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    fileInput.addEventListener('change', () => {
+      setFile(fileInput.files?.[0]);
+    });
+
+    ['dragenter', 'dragover'].forEach(evt => {
+      dropZone.addEventListener(evt, e => {
+        e.preventDefault();
+        dropZone.classList.add('dragover');
+      });
+    });
+
+    ['dragleave', 'drop'].forEach(evt => {
+      dropZone.addEventListener(evt, e => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+      });
+    });
+
+    dropZone.addEventListener('drop', e => {
+      const file = e.dataTransfer.files?.[0];
+      setFile(file);
+    });
+
+    function setFile(file) {
+      if (!file) return;
+      if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+        status.textContent = 'El archivo seleccionado no parece ser un PDF.';
+        return;
+      }
+
+      selectedFile = file;
+      fileInfo.textContent = `${file.name} — ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+      status.textContent = 'Listo para rasterizar.';
+      progress.value = 0;
+      rasterizeBtn.disabled = false;
+    }
+
+    function canvasToJpeg(canvas, quality) {
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(blob => {
+          if (!blob) return reject(new Error('No se pudo crear la imagen JPEG.'));
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        }, 'image/jpeg', quality);
+      });
+    }
+
+    rasterizeBtn.addEventListener('click', async () => {
+      if (!selectedFile) return;
+
+      rasterizeBtn.disabled = true;
+      progress.value = 0;
+
+      try {
+        const dpi = Number(dpiSelect.value);
+        const jpegQuality = Number(qualityRange.value) / 100;
+        const scale = dpi / 72;
+
+        status.textContent = 'Leyendo PDF...';
+        const bytes = new Uint8Array(await selectedFile.arrayBuffer());
+        const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+
+        let outputPdf = null;
+
+        for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+          status.textContent = `Rasterizando página ${pageNumber} de ${pdf.numPages}...`;
+
+          const page = await pdf.getPage(pageNumber);
+          const viewport = page.getViewport({ scale });
+
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d', { alpha: false });
+          canvas.width = Math.ceil(viewport.width);
+          canvas.height = Math.ceil(viewport.height);
+
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+          await page.render({ canvasContext: ctx, viewport }).promise;
+
+          const jpegData = await canvasToJpeg(canvas, jpegQuality);
+
+          // PDF.js viewport trabaja en puntos CSS escalados. Para conservar el
+          // tamaño físico original usamos el viewport a escala 1.
+          const originalViewport = page.getViewport({ scale: 1 });
+          const pageWidthPt = originalViewport.width;
+          const pageHeightPt = originalViewport.height;
+          const orientation = pageWidthPt > pageHeightPt ? 'landscape' : 'portrait';
+
+          if (!outputPdf) {
+            outputPdf = new jsPDF({
+              orientation,
+              unit: 'pt',
+              format: [pageWidthPt, pageHeightPt],
+              compress: true
+            });
+          } else {
+            outputPdf.addPage([pageWidthPt, pageHeightPt], orientation);
+          }
+
+          outputPdf.addImage(
+            jpegData,
+            'JPEG',
+            0,
+            0,
+            pageWidthPt,
+            pageHeightPt,
+            undefined,
+            'FAST'
+          );
+
+          // Liberar memoria agresivamente.
+          canvas.width = 1;
+          canvas.height = 1;
+          page.cleanup();
+
+          progress.value = Math.round((pageNumber / pdf.numPages) * 100);
+          await new Promise(requestAnimationFrame);
+        }
+
+        status.textContent = 'Generando archivo final...';
+        const baseName = selectedFile.name.replace(/\.pdf$/i, '');
+        outputPdf.save(`${baseName}_rasterizado.pdf`);
+        status.textContent = 'Completado. El PDF rasterizado fue generado.';
+      } catch (error) {
+        console.error(error);
+        status.textContent = `Error: ${error.message || error}`;
+      } finally {
+        rasterizeBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
