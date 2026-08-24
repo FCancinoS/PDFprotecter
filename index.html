@@ -119,21 +119,27 @@
     </div>
 
     <div class="note">
-      No se aplica OCR. El PDF resultante contiene una imagen por página. Después se aplican permisos con qpdf: impresión permitida; copia/extracción y modificación deshabilitadas. El archivo abre sin pedir contraseña.
+      No se aplica OCR. El PDF resultante contiene una imagen por página. Después qpdf aplica permisos: impresión permitida; copia/extracción y modificación deshabilitadas. El archivo abre normalmente, sin pedir contraseña.
     </div>
   </main>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs" type="module"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 
   <script type="module">
     import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs';
-    import createQpdfModule from 'https://esm.sh/@neslinesli93/qpdf-wasm@0.3.0';
 
     pdfjsLib.GlobalWorkerOptions.workerSrc =
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
 
     const { jsPDF } = window.jspdf;
+
+    // Runtime qpdf/WASM browser-only tomado del paquete qpdf-run.
+    // El Worker se crea desde un Blob local para evitar problemas de Worker cross-origin
+    // cuando este HTML se abre directamente con file://.
+    const QPDF_JS_URL =
+      'https://cdn.jsdelivr.net/npm/qpdf-run@0.2.1/vendor/qpdf/lib/qpdf.js';
+    const QPDF_WASM_URL =
+      'https://cdn.jsdelivr.net/npm/qpdf-run@0.2.1/vendor/qpdf/lib/qpdf.wasm';
 
     const fileInput = document.getElementById('fileInput');
     const dropZone = document.getElementById('dropZone');
@@ -202,6 +208,177 @@
       });
     }
 
+    function makeRandomOwnerPassword() {
+      const bytes = new Uint8Array(32);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function createQpdfWorker() {
+      const workerSource = `
+        let qpdfReady = false;
+        let qpdfInitPromise = null;
+        let wasmUrl = '';
+        let stdout = [];
+        let stderr = [];
+
+        self.Module = {
+          thisProgram: 'qpdf',
+          noInitialRun: true,
+          print(text) { stdout.push(String(text)); },
+          printErr(text) { stderr.push(String(text)); },
+          onRuntimeInitialized() {
+            qpdfReady = true;
+            if (qpdfInitPromise) qpdfInitPromise.resolve();
+          },
+          locateFile(path, prefix) {
+            if (path.endsWith('.wasm') && wasmUrl) return wasmUrl;
+            return prefix + path;
+          },
+          quit(status, toThrow) {
+            if (toThrow) throw toThrow;
+            throw status;
+          }
+        };
+
+        function initQpdf(qpdfJsUrl, qpdfWasmUrl) {
+          if (qpdfReady) return Promise.resolve();
+          if (qpdfInitPromise) return qpdfInitPromise.promise;
+
+          wasmUrl = qpdfWasmUrl;
+          qpdfInitPromise = {};
+          qpdfInitPromise.promise = new Promise((resolve, reject) => {
+            qpdfInitPromise.resolve = resolve;
+            qpdfInitPromise.reject = reject;
+          });
+
+          try {
+            importScripts(qpdfJsUrl);
+          } catch (error) {
+            qpdfInitPromise.reject(error);
+          }
+
+          return qpdfInitPromise.promise;
+        }
+
+        function exists(path) {
+          try { return FS.analyzePath(path).exists; }
+          catch (_) { return false; }
+        }
+
+        function remove(path) {
+          try { if (exists(path)) FS.unlink(path); }
+          catch (_) {}
+        }
+
+        self.onmessage = async event => {
+          const message = event.data || {};
+
+          if (message.type === 'destroy') {
+            self.close();
+            return;
+          }
+
+          if (message.type !== 'run') return;
+
+          stdout = [];
+          stderr = [];
+
+          try {
+            await initQpdf(message.qpdfJsUrl, message.wasmUrl);
+
+            const inputName = '/in.pdf';
+            const outputName = '/out.pdf';
+            remove(inputName);
+            remove(outputName);
+
+            FS.writeFile(inputName, new Uint8Array(message.input));
+
+            let exitCode = 0;
+            try {
+              const result = callMain(message.args);
+              exitCode = Number.isFinite(result) ? result : (typeof EXITSTATUS === 'number' ? EXITSTATUS : 0);
+            } catch (error) {
+              const status = typeof EXITSTATUS === 'number' ? EXITSTATUS : 0;
+              if (status) exitCode = status;
+              else throw error;
+            }
+
+            if (exitCode !== 0 && exitCode !== 3) {
+              throw new Error('qpdf terminó con código ' + exitCode + (stderr.length ? ': ' + stderr.join('\\n') : ''));
+            }
+
+            if (!exists(outputName)) {
+              throw new Error('qpdf no generó el PDF de salida. ' + stderr.join('\\n'));
+            }
+
+            const view = FS.readFile(outputName, { encoding: 'binary' });
+            const output = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+
+            remove(inputName);
+            remove(outputName);
+
+            self.postMessage({ ok: true, output, stdout, stderr, exitCode }, [output]);
+          } catch (error) {
+            self.postMessage({
+              ok: false,
+              error: error && error.message ? error.message : String(error),
+              stdout,
+              stderr
+            });
+          }
+        };
+      `;
+
+      const blob = new Blob([workerSource], { type: 'text/javascript' });
+      const url = URL.createObjectURL(blob);
+      const worker = new Worker(url);
+      worker.__blobUrl = url;
+      return worker;
+    }
+
+    function runQpdf(inputBytes, args) {
+      return new Promise((resolve, reject) => {
+        const worker = createQpdfWorker();
+        const timer = setTimeout(() => {
+          worker.terminate();
+          URL.revokeObjectURL(worker.__blobUrl);
+          reject(new Error('qpdf tardó demasiado en responder.'));
+        }, 120000);
+
+        const cleanup = () => {
+          clearTimeout(timer);
+          worker.terminate();
+          URL.revokeObjectURL(worker.__blobUrl);
+        };
+
+        worker.onmessage = event => {
+          const result = event.data || {};
+          cleanup();
+          if (!result.ok) {
+            reject(new Error(result.error || 'qpdf falló al aplicar los permisos.'));
+            return;
+          }
+          resolve(new Uint8Array(result.output));
+        };
+
+        worker.onerror = event => {
+          cleanup();
+          reject(new Error(event.message || 'No se pudo iniciar qpdf en el navegador.'));
+        };
+
+        // Copiamos los bytes antes de transferirlos para no invalidar rasterizedBytes.
+        const transferable = inputBytes.slice().buffer;
+        worker.postMessage({
+          type: 'run',
+          input: transferable,
+          args,
+          qpdfJsUrl: QPDF_JS_URL,
+          wasmUrl: QPDF_WASM_URL
+        }, [transferable]);
+      });
+    }
+
     rasterizeBtn.addEventListener('click', async () => {
       if (!selectedFile) return;
 
@@ -237,8 +414,6 @@
 
           const jpegData = await canvasToJpeg(canvas, jpegQuality);
 
-          // PDF.js viewport trabaja en puntos CSS escalados. Para conservar el
-          // tamaño físico original usamos el viewport a escala 1.
           const originalViewport = page.getViewport({ scale: 1 });
           const pageWidthPt = originalViewport.width;
           const pageHeightPt = originalViewport.height;
@@ -266,72 +441,47 @@
             'FAST'
           );
 
-          // Liberar memoria agresivamente.
           canvas.width = 1;
           canvas.height = 1;
           page.cleanup();
 
-          progress.value = Math.round((pageNumber / pdf.numPages) * 100);
+          // Reservamos 10% del progreso para la etapa qpdf.
+          progress.value = Math.round((pageNumber / pdf.numPages) * 90);
           await new Promise(requestAnimationFrame);
         }
 
         status.textContent = 'Generando PDF rasterizado...';
         progress.value = 92;
-
-        // jsPDF entrega el PDF rasterizado como bytes, sin descargarlo todavía.
         const rasterizedBytes = new Uint8Array(outputPdf.output('arraybuffer'));
 
         status.textContent = 'Aplicando permisos con qpdf...';
+        progress.value = 95;
 
-        // El destinatario no necesita contraseña para abrir el PDF.
-        // La contraseña de propietario se genera aleatoriamente en memoria
-        // únicamente para que el estándar PDF pueda almacenar los permisos.
-        const randomOwnerPassword = (() => {
-          const bytes = new Uint8Array(32);
-          crypto.getRandomValues(bytes);
-          return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-        })();
+        // No hay contraseña de apertura: user-password queda vacío.
+        // El owner-password aleatorio se usa únicamente como mecanismo interno
+        // para que los lectores compatibles respeten los permisos del PDF.
+        const ownerPassword = makeRandomOwnerPassword();
 
-        const qpdf = await createQpdfModule({
-          locateFile: file => file.endsWith('.wasm')
-            ? 'https://cdn.jsdelivr.net/npm/@neslinesli93/qpdf-wasm@0.3.0/dist/qpdf.wasm'
-            : file
-        });
-
-        const inputPath = '/rasterized-input.pdf';
-        const outputPath = '/protected-output.pdf';
-
-        try {
-          qpdf.FS.unlink(inputPath);
-        } catch (_) {}
-        try {
-          qpdf.FS.unlink(outputPath);
-        } catch (_) {}
-
-        qpdf.FS.writeFile(inputPath, rasterizedBytes);
-
-        // Permisos solicitados:
-        //   - imprimir: permitido en resolución completa
-        //   - modificar: no permitido
-        //   - copiar / extraer texto o gráficos: no permitido
-        // User password vacío => abre sin pedir contraseña.
-        qpdf.callMain([
+        const qpdfArgs = [
           '--encrypt',
-          '',
-          randomOwnerPassword,
-          '256',
+          '--user-password=',
+          `--owner-password=${ownerPassword}`,
+          '--bits=256',
           '--print=full',
           '--modify=none',
           '--extract=n',
           '--',
-          inputPath,
-          outputPath
-        ]);
+          '/in.pdf',
+          '/out.pdf'
+        ];
 
-        const protectedBytes = qpdf.FS.readFile(outputPath).slice();
+        const protectedBytes = await runQpdf(rasterizedBytes, qpdfArgs);
+
+        status.textContent = 'Preparando descarga...';
+        progress.value = 99;
+
         const finalBlob = new Blob([protectedBytes], { type: 'application/pdf' });
         const downloadUrl = URL.createObjectURL(finalBlob);
-
         const baseName = selectedFile.name.replace(/\.pdf$/i, '');
         const link = document.createElement('a');
         link.href = downloadUrl;
@@ -341,12 +491,8 @@
         link.remove();
         setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
 
-        // Borrar los PDFs del sistema de archivos virtual de qpdf.
-        try { qpdf.FS.unlink(inputPath); } catch (_) {}
-        try { qpdf.FS.unlink(outputPath); } catch (_) {}
-
         progress.value = 100;
-        status.textContent = 'Completado: rasterizado + impresión permitida + copia/extracción y modificación bloqueadas.';
+        status.textContent = 'Completado: impresión permitida; copia/extracción y modificación bloqueadas.';
       } catch (error) {
         console.error(error);
         status.textContent = `Error: ${error.message || error}`;
