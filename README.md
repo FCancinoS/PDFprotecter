@@ -4,7 +4,9 @@ A **privacy-first, client-side PDF hardening tool** built with JavaScript and We
 
 PDF Protecter prepares sensitive documents for external sharing by combining **full-page rasterization** with PDF permission restrictions — entirely in the browser.
 
-### [Live Demo](https://fcancinos.github.io/PDFprotecter/)
+<a href="https://fcancinos.github.io/PDFprotecter/" target="_blank">
+  Live Demo
+</a>
 
 ## What it does
 
