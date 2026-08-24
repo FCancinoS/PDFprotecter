@@ -111,7 +111,7 @@
       </label>
     </div>
 
-    <button id="rasterizeBtn" disabled>Rasterizar y descargar PDF</button>
+    <button id="rasterizeBtn" disabled>Rasterizar, proteger y descargar PDF</button>
 
     <div style="margin-top:18px">
       <progress id="progress" value="0" max="100"></progress>
@@ -119,7 +119,7 @@
     </div>
 
     <div class="note">
-      No se aplica OCR. El PDF resultante contiene una imagen por página. Si el original tiene enlaces, formularios, texto seleccionable o vectores, se perderán deliberadamente.
+      No se aplica OCR. El PDF resultante contiene una imagen por página. Después se aplican permisos con qpdf: impresión permitida; copia/extracción y modificación deshabilitadas. El archivo abre sin pedir contraseña.
     </div>
   </main>
 
@@ -128,6 +128,7 @@
 
   <script type="module">
     import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs';
+    import createQpdfModule from 'https://esm.sh/@neslinesli93/qpdf-wasm@0.3.0';
 
     pdfjsLib.GlobalWorkerOptions.workerSrc =
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
@@ -274,10 +275,78 @@
           await new Promise(requestAnimationFrame);
         }
 
-        status.textContent = 'Generando archivo final...';
+        status.textContent = 'Generando PDF rasterizado...';
+        progress.value = 92;
+
+        // jsPDF entrega el PDF rasterizado como bytes, sin descargarlo todavía.
+        const rasterizedBytes = new Uint8Array(outputPdf.output('arraybuffer'));
+
+        status.textContent = 'Aplicando permisos con qpdf...';
+
+        // El destinatario no necesita contraseña para abrir el PDF.
+        // La contraseña de propietario se genera aleatoriamente en memoria
+        // únicamente para que el estándar PDF pueda almacenar los permisos.
+        const randomOwnerPassword = (() => {
+          const bytes = new Uint8Array(32);
+          crypto.getRandomValues(bytes);
+          return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        })();
+
+        const qpdf = await createQpdfModule({
+          locateFile: file => file.endsWith('.wasm')
+            ? 'https://cdn.jsdelivr.net/npm/@neslinesli93/qpdf-wasm@0.3.0/dist/qpdf.wasm'
+            : file
+        });
+
+        const inputPath = '/rasterized-input.pdf';
+        const outputPath = '/protected-output.pdf';
+
+        try {
+          qpdf.FS.unlink(inputPath);
+        } catch (_) {}
+        try {
+          qpdf.FS.unlink(outputPath);
+        } catch (_) {}
+
+        qpdf.FS.writeFile(inputPath, rasterizedBytes);
+
+        // Permisos solicitados:
+        //   - imprimir: permitido en resolución completa
+        //   - modificar: no permitido
+        //   - copiar / extraer texto o gráficos: no permitido
+        // User password vacío => abre sin pedir contraseña.
+        qpdf.callMain([
+          '--encrypt',
+          '',
+          randomOwnerPassword,
+          '256',
+          '--print=full',
+          '--modify=none',
+          '--extract=n',
+          '--',
+          inputPath,
+          outputPath
+        ]);
+
+        const protectedBytes = qpdf.FS.readFile(outputPath).slice();
+        const finalBlob = new Blob([protectedBytes], { type: 'application/pdf' });
+        const downloadUrl = URL.createObjectURL(finalBlob);
+
         const baseName = selectedFile.name.replace(/\.pdf$/i, '');
-        outputPdf.save(`${baseName}_rasterizado.pdf`);
-        status.textContent = 'Completado. El PDF rasterizado fue generado.';
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = `${baseName}_rasterizado_protegido.pdf`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+
+        // Borrar los PDFs del sistema de archivos virtual de qpdf.
+        try { qpdf.FS.unlink(inputPath); } catch (_) {}
+        try { qpdf.FS.unlink(outputPath); } catch (_) {}
+
+        progress.value = 100;
+        status.textContent = 'Completado: rasterizado + impresión permitida + copia/extracción y modificación bloqueadas.';
       } catch (error) {
         console.error(error);
         status.textContent = `Error: ${error.message || error}`;
