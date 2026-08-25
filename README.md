@@ -7,13 +7,12 @@ PDF Protecter prepares sensitive documents for external sharing by combining **f
 <a href="https://fcancinos.github.io/PDFprotecter/" target="_blank">
   Live Demo
 </a>
-  
-    
-      
-      
+<br>
+<br>
 <p align="center">
   <img src="SC.png" alt="PDF Protecter Screenshot" width="900">
 </p>
+
 ## What it does
 
 * Rasterizes every PDF page, removing the original text, vectors and editable structure.
